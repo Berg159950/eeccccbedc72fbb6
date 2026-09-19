@@ -1,0 +1,365 @@
+name: build-bun-penryn
+
+on:
+  workflow_dispatch:
+    inputs:
+      bun_tag:
+        description: Bun tag to build (empty = latest stable release)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: write
+
+env:
+  BUN_TAG: ${{ github.event.inputs.bun_tag }}
+
+jobs:
+  check-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - name: Resolve Bun tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$BUN_TAG" ]; then
+            TAG="$BUN_TAG"
+          else
+            TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/oven-sh/bun/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+' | head -1 || true)
+          fi
+          [ -n "$TAG" ] || { echo "Failed to resolve Bun tag"; exit 1; }
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          VER="${TAG#bun-v}"
+          VER="${VER#v}"
+          echo "version=$VER" >> $GITHUB_OUTPUT
+          echo "Using Bun tag: $TAG -> version $VER"
+
+  build:
+    needs: check-version
+    runs-on: ubuntu-24.04
+    outputs:
+      bun_version: ${{ needs.check-version.outputs.version }}
+      bun_sha256: ${{ steps.sha256.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore intermediate bun binary
+        id: restore
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: build-bun.yml
+          name: stage-bun-linux-x64-${{ needs.check-version.outputs.version }}-${{ hashFiles('.github/workflows/build-bun.yml') }}
+          path: /tmp/stage
+          if_no_artifact_found: warn
+
+      - name: Restore source cache
+        id: src-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/bun-src
+          key: src-bun-linux-${{ needs.check-version.outputs.version }}
+
+      - name: Restore Bun build cache
+        id: bun-cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/bun-cache
+          key: buncache-linux-${{ needs.check-version.outputs.version }}-${{ github.run_id }}
+          restore-keys: |
+            buncache-linux-${{ needs.check-version.outputs.version }}-
+
+      - name: Install system deps
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache cmake ninja-build patchelf nasm automake autoconf libtool
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/llvm.asc
+          sudo add-apt-repository -y "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang-21 lld-21
+          sudo ln -sf /usr/bin/clang-21 /usr/lib/ccache/clang
+          sudo ln -sf /usr/bin/clang++-21 /usr/lib/ccache/clang++
+          sudo ln -sf /usr/bin/lld-21 /usr/local/bin/lld
+          sudo ln -sf /usr/bin/llvm-ar-21 /usr/local/bin/llvm-ar
+          sudo ln -sf /usr/bin/llvm-ranlib-21 /usr/local/bin/llvm-ranlib
+          which clang && clang --version | head -1
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CXX=clang++" >> $GITHUB_ENV
+
+      - name: Free disk space
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Setup ccache
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          export CCACHE_DIR=/tmp/bun-cache/ccache
+          ccache -M 3G
+          ccache -s || true
+
+      - name: Setup Bun (for build script)
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Clone Bun
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          clone_fresh() {
+            rm -rf /tmp/bun-src
+            for i in 1 2 3; do
+              git clone --depth 1 https://github.com/oven-sh/bun.git /tmp/bun-src && break
+              [ $i -lt 3 ] && sleep 10
+            done
+            [ -d /tmp/bun-src/.git ] || exit 1
+          }
+          if [ -d /tmp/bun-src/.git ]; then
+            echo "reusing cached bun source"
+            cd /tmp/bun-src
+            if ! git fetch --depth 1 origin ${{ needs.check-version.outputs.tag }}; then
+              echo "fetch failed, recloning"
+              clone_fresh
+              cd /tmp/bun-src
+              for i in 1 2 3; do
+                git fetch --depth 1 origin ${{ needs.check-version.outputs.tag }} && break
+                [ $i -lt 3 ] && sleep 10
+              done
+            fi
+          else
+            clone_fresh
+            cd /tmp/bun-src
+            for i in 1 2 3; do
+              git fetch --depth 1 origin ${{ needs.check-version.outputs.tag }} && break
+              [ $i -lt 3 ] && sleep 10
+            done
+          fi
+          git checkout FETCH_HEAD
+          rm -rf /tmp/bun-src/build /tmp/bun-src/dist
+
+      - name: Resolve WebKit version from Bun source
+        if: steps.restore.outputs.found_artifact != 'true'
+        id: webkit
+        run: |
+          cd /tmp/bun-src
+          WEBKIT_VER=""
+          for f in scripts/build/deps/webkit.ts scripts/build/deps/webkit.js vendor/webkit-version.txt .github/workflows/*.yml; do
+            if [ -f "$f" ]; then
+              WEBKIT_VER=$(grep -oE '[0-9a-f]{40}' "$f" | head -1)
+              [ -n "$WEBKIT_VER" ] && break
+            fi
+          done
+          if [ -z "$WEBKIT_VER" ]; then
+            WEBKIT_VER=$(grep -r "oven-sh/WebKit" --include="*.ts" --include="*.js" --include="*.json" . 2>/dev/null | grep -oE '[0-9a-f]{40}' | head -1)
+          fi
+          [ -z "$WEBKIT_VER" ] && WEBKIT_VER="549170099226f816a4b204ea1d8fa102fb79eefa"
+          echo "version=$WEBKIT_VER" >> $GITHUB_OUTPUT
+          echo "Resolved WebKit version: $WEBKIT_VER"
+
+      - name: Apply Penryn patch
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd /tmp/bun-src
+          sed -i 's/-march=nehalem/-march=penryn/g' scripts/build/flags.ts
+          perl -0pi -e 's/export const globalFlags: Flag\[\] = \[/export const globalFlags: Flag[] = [\n  {\n    flag: ["-mno-sse4.2", "-mno-popcnt", "-DSIMDUTF_IMPLEMENTATION_ICELAKE=0", "-DSIMDUTF_IMPLEMENTATION_HASWELL=0"],\n    when: c => c.x64,\n    desc: "Penryn baseline: no SSE4.2\/POPCNT",\n  },/' scripts/build/flags.ts
+          grep -q 'mno-sse4.2' scripts/build/flags.ts || { echo "ERROR: globalFlags patch failed"; exit 1; }
+          grep -rl "HWY_DISABLED_TARGETS" scripts/ | while read f; do
+            perl -pi -e 's/HWY_DISABLED_TARGETS=[^"'"'"'\s,\]]+/HWY_DISABLED_TARGETS=3032/g' "$f"
+            perl -pi -e 's/HWY_ALL_SVE-HWY_SVE2_128/3032/g' "$f"
+          done
+          if ! grep -rq "HWY_DISABLED_TARGETS=3032" scripts/; then
+            perl -pi -e 's/"-mno-popcnt"/"-mno-popcnt", "-DHWY_DISABLED_TARGETS=3032"/' scripts/build/flags.ts
+          fi
+          echo "HWY values in use:"
+          grep -rho "HWY_DISABLED_TARGETS=[^\"' ,;]*" scripts/ | sort -u
+          sed -i 's/-Ctarget-cpu=nehalem/-Ctarget-cpu=penryn/g' scripts/build/rust.ts
+          sed -i 's/"nehalem"/"penryn"/g' scripts/build/rust.ts
+          sed -i 's/Nehalem/Penryn/g' scripts/verify-baseline.ts
+          sed -i 's/NEHALEM_ALLOWED/PENRYN_ALLOWED/g' scripts/verify-baseline-static/src/main.rs
+          sed -i 's/nehalem/penryn/g' scripts/verify-baseline-static/src/main.rs
+          find . -name "CMakeLists.txt" -exec sed -i 's/-march=nehalem/-march=penryn/g' {} +
+          find . -name "CMakeLists.txt" -exec sed -i 's/target-cpu=nehalem/target-cpu=penryn/g' {} +
+          bun -e "const fs=require('fs');let l=fs.readFileSync('scripts/build/deps/zlib.ts','utf8').split('\n');l.splice(78,22);fs.writeFileSync('scripts/build/deps/zlib.ts',l.join('\n'))"
+          sed -i 's/"_avx2.c", "-mavx2"/"_avx2.c", "-msse4.1"/' scripts/build/deps/libwebp.ts
+          grep -rl --include="*.ts" "nehalem" scripts/ test/ | while read f; do
+            sed -i 's/\bnehalem\b/penryn/g; s/\bNehalem\b/Penryn/g; s/\bNEHALEM\b/PENRYN/g' "$f"
+          done
+          grep -rn --include="CMakeLists.txt" --include="*.ts" --include="*.rs" --exclude-dir=test --exclude-dir=.git "march=nehalem\|target-cpu=nehalem" . && { echo "ERROR: Nehalem still present!"; exit 1; } || echo "All Nehalem references patched successfully"
+
+      - name: Clone WebKit (required for --webkit=local)
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          mkdir -p /tmp/bun-src/vendor
+          if [ -d /tmp/bun-src/vendor/WebKit/.git ]; then
+            echo "reusing cached WebKit source"
+          else
+            rm -rf /tmp/bun-src/vendor/WebKit
+            for i in 1 2 3; do
+              git clone --depth 1 https://github.com/oven-sh/WebKit.git /tmp/bun-src/vendor/WebKit && break
+              [ $i -lt 3 ] && sleep 10
+            done
+            [ -d /tmp/bun-src/vendor/WebKit/.git ] || exit 1
+          fi
+          cd /tmp/bun-src/vendor/WebKit
+          for i in 1 2 3; do
+            git fetch --depth 1 origin ${{ steps.webkit.outputs.version }} && break
+            [ $i -lt 3 ] && sleep 10
+          done
+          git checkout FETCH_HEAD
+
+      - name: Save source cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/bun-src
+          key: src-bun-linux-${{ needs.check-version.outputs.version }}
+
+      - name: Patch WebKit simdutf
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd /tmp/bun-src
+          WD="vendor/WebKit/Source/WTF/wtf/simdutf"
+          [ -d "$WD" ] || WD="vendor/WebKit/Source/ThirdParty/simdutf"
+          [ -d "$WD" ] || WD="src/simdutf_sys"
+          echo "simdutf dir: $WD"
+          [ -d "$WD" ] || { echo "ERROR: simdutf dir not found"; exit 1; }
+          FILES=$(grep -rl "SIMDUTF_TARGET_WESTMERE" "$WD" 2>/dev/null)
+          [ -n "$FILES" ] || { echo "ERROR: simdutf sources not found in $WD"; exit 1; }
+          for f in $FILES; do
+            perl -pi -e 's/\r\n?/\n/g' "$f"
+            perl -0pi -e 's/(#ifndef SIMDUTF_IMPLEMENTATION_ICELAKE\n)(?:.*\n)*?(#endif)/$1  #define SIMDUTF_IMPLEMENTATION_ICELAKE 0\n$2/' "$f"
+            sed -i 's/#define SIMDUTF_IMPLEMENTATION_HASWELL (SIMDUTF_IS_X86_64)/#define SIMDUTF_IMPLEMENTATION_HASWELL 0/' "$f"
+            sed -i 's/#define SIMDUTF_TARGET_WESTMERE SIMDUTF_TARGET_REGION("sse4.2,popcnt")/#define SIMDUTF_TARGET_WESTMERE SIMDUTF_TARGET_REGION("sse4.1")/' "$f"
+            sed -i 's/\b_popcnt64\b/__builtin_popcountll/g; s/\b__popcnt64\b/__builtin_popcountll/g; s/\b_popcnt32\b/__builtin_popcount/g; s/\b__popcnt\b/__builtin_popcount/g; s/\b_mm_popcnt_u64\b/__builtin_popcountll/g; s/\b_mm_popcnt_u32\b/__builtin_popcount/g' "$f"
+            echo "simdutf patched: $f"
+          done
+          { grep -rhn "define SIMDUTF_IMPLEMENTATION_\(HASWELL\|ICELAKE\)" "$WD" 2>/dev/null || true; } | grep -v " 0$" && { echo "ERROR: haswell/icelake still enabled!"; exit 1; } || echo "simdutf: haswell/icelake disabled OK"
+          grep -rn "_popcnt64\|_popcnt32\|__popcnt64\|__popcnt\b\|_mm_popcnt_u64\|_mm_popcnt_u32" "$WD" 2>/dev/null && { echo "ERROR: POPCNT intrinsics still present in simdutf!"; exit 1; } || echo "simdutf: POPCNT intrinsics removed OK"
+
+      - name: Build Bun (with local WebKit)
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          cd /tmp/bun-src
+          bun run build:release --webkit=local --cacheDir=/tmp/bun-cache 2>&1
+
+      - name: Save Bun build cache
+        if: steps.restore.outputs.found_artifact != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/bun-cache
+          key: buncache-linux-${{ needs.check-version.outputs.version }}-${{ github.run_id }}
+
+      - name: Stage built binary
+        if: steps.restore.outputs.found_artifact != 'true'
+        run: |
+          BUN_BIN="/tmp/bun-src/build/release/bun"
+          [ -f "$BUN_BIN" ] || BUN_BIN="/tmp/bun-src/dist/bun/bun"
+          [ -f "$BUN_BIN" ] || { echo "built bun not found"; exit 1; }
+          echo "BUN_BIN=$BUN_BIN" >> $GITHUB_ENV
+          mkdir -p /tmp/stage
+          cp "$BUN_BIN" /tmp/stage/bun.bin
+          chmod +x /tmp/stage/bun.bin
+
+      - name: Upload intermediate binary
+        if: steps.restore.outputs.found_artifact != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-bun-linux-x64-${{ needs.check-version.outputs.version }}-${{ hashFiles('.github/workflows/build-bun.yml') }}
+          path: /tmp/stage/bun.bin
+
+      - name: Use restored binary
+        if: steps.restore.outputs.found_artifact == 'true'
+        run: |
+          [ -f /tmp/stage/bun.bin ] || { echo "restored bun.bin missing"; exit 1; }
+          chmod +x /tmp/stage/bun.bin
+          echo "BUN_BIN=/tmp/stage/bun.bin" >> $GITHUB_ENV
+
+      - name: QEMU Penryn verify
+        run: |
+          sudo apt-get install -y -qq qemu-user
+          qemu-x86_64 -cpu Penryn "$BUN_BIN" --version
+
+      - name: Static ISA verify (no POPCNT/AVX/AVX-512)
+        run: |
+          objdump -d "$BUN_BIN" > /tmp/disasm.txt 2>/dev/null
+          echo "=== Instruction counts ==="
+          for pat in "popcnt" "vpopcntq\|vpopcntd" "vaes" "vzeroupper" "vpbroadcast" "vpxor" "vmovdqa\|vmovdqu" "vpmov" "vpshuf\|vperm" "vpadd" "vpand\|vpor" "vpsll\|vpsrl\|vpsra" "vpblend" "vpgather"; do
+            echo "$pat: $(grep -c "\b$pat" /tmp/disasm.txt)"
+          done
+          echo "=== POPCNT check (must be 0) ==="
+          if grep -qE '\bpopcnt\b' /tmp/disasm.txt; then
+            echo "ERROR: POPCNT instructions still present in binary!"
+            grep -nE '\bpopcnt\b' /tmp/disasm.txt | head -20
+            exit 1
+          fi
+          echo "OK: zero POPCNT instructions"
+          echo "=== VPOPCNT (AVX-512) check (must be 0) ==="
+          if grep -qE '\bvpopcntq\b|\bvpopcntd\b' /tmp/disasm.txt; then
+            echo "ERROR: AVX-512 VPOPCNT instructions still present in binary!"
+            grep -nE '\bvpopcntq\b|\bvpopcntd\b' /tmp/disasm.txt | head -20
+            exit 1
+          fi
+          echo "OK: zero AVX-512 VPOPCNT instructions"
+          echo "=== VAES check (informational: BoringSSL asm, CPUID-gated) ==="
+          echo "vaes: $(grep -c '\bvaes' /tmp/disasm.txt)"
+
+      - name: Bundle libs
+        run: |
+          mkdir -p /tmp/bundle/lib
+          cp "$BUN_BIN" /tmp/bundle/bun.bin
+          ldd /tmp/bundle/bun.bin 2>/dev/null | grep "=> /" | awk '{print $3}' | while read lib; do
+            cp -n "$lib" /tmp/bundle/lib/ 2>/dev/null || true
+          done
+          rm -f /tmp/bundle/lib/libc.so.6 /tmp/bundle/lib/libm.so.6 2>/dev/null || true
+          cat > /tmp/bundle/bun << 'WRAPPER'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$DIR/bun.bin" "$@"
+          WRAPPER
+          chmod +x /tmp/bundle/bun /tmp/bundle/bun.bin
+
+      - name: Smoke test
+        run: |
+          LD_LIBRARY_PATH= /tmp/bundle/bun --version
+
+      - name: Package artifact
+        run: |
+          tar czf /tmp/bun-penryn-linux-x64.tar.gz -C /tmp/bundle .
+
+      - name: Compute SHA256
+        id: sha256
+        run: |
+          SHA=$(sha256sum /tmp/bun-penryn-linux-x64.tar.gz | cut -d' ' -f1)
+          echo "sha256=$SHA" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: bun-penryn-${{ needs.check-version.outputs.version }}-${{ github.run_id }}
+          name: Bun Penryn ${{ needs.check-version.outputs.version }}
+          body: |
+            Bun ${{ needs.check-version.outputs.version }} built for Penryn (SSE 4.1)
+            SHA256: ${{ steps.sha256.outputs.sha256 }}
+          files: /tmp/bun-penryn-linux-x64.tar.gz
+          draft: false
+          prerelease: false
+
+      - name: Upload artifact (backup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-penryn-linux-x64
+          path: /tmp/bun-penryn-linux-x64.tar.gz
