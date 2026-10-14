@@ -227,7 +227,17 @@ jobs:
             git fetch --depth 1 origin ${{ steps.webkit.outputs.version }} && break
             [ $i -lt 3 ] && sleep 10
           done
-          git checkout FETCH_HEAD
+          # The source cache may hold a tree from a different WebKit pin;
+          # renamed/removed upstream files then linger as untracked leftovers
+          # and block the checkout ("would be removed by checkout"). Retry
+          # with a clean tree only in that case: when the pin is unchanged
+          # the plain checkout succeeds and cached WebKit build outputs
+          # (untracked, under vendor/) are preserved for reuse.
+          if ! git checkout FETCH_HEAD; then
+            echo "checkout blocked by stale cached tree, cleaning untracked files and retrying"
+            git clean -fd
+            git checkout -f FETCH_HEAD
+          fi
 
       - name: Save source cache
         if: steps.restore.outputs.found_artifact != 'true'
