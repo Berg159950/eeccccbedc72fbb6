@@ -190,7 +190,18 @@ jobs:
           sed -i 's/nehalem/penryn/g' scripts/verify-baseline-static/src/main.rs
           find . -name "CMakeLists.txt" -exec sed -i 's/-march=nehalem/-march=penryn/g' {} +
           find . -name "CMakeLists.txt" -exec sed -i 's/target-cpu=nehalem/target-cpu=penryn/g' {} +
-          bun -e "const fs=require('fs');let l=fs.readFileSync('scripts/build/deps/zlib.ts','utf8').split('\n');l.splice(78,22);fs.writeFileSync('scripts/build/deps/zlib.ts',l.join('\n'))"
+          # zlib-ng: upstream refactored scripts/build/deps/zlib.ts into a
+          # SimdKernel table (X86_SSE2 ... X86_VPCLMULQDQ_CRC), so the old
+          # line-number splice(78,22) corrupts the file (it now cuts inside
+          # `export const zlib`). Filter by content instead: keep only
+          # kernels at/below Penryn (SSE4.1; no SSE4.2/PCLMUL/AVX*). New
+          # upstream AVX entries are excluded automatically (allowlist).
+          perl -0pi -e 's/kernels = X86;/kernels = X86.filter(k => ["X86_SSE2", "X86_SSSE3", "X86_SSE41"].includes(k.define));/' scripts/build/deps/zlib.ts
+          grep -q 'X86\.filter' scripts/build/deps/zlib.ts || { echo "ERROR: zlib Penryn filter patch failed"; exit 1; }
+          for d in X86_SSE2 X86_SSSE3 X86_SSE41; do
+            grep -q "define: \"$d\"" scripts/build/deps/zlib.ts || { echo "ERROR: zlib kernel $d missing upstream, allowlist stale"; exit 1; }
+          done
+          bun -e "const t = new Bun.Transpiler({loader:'ts'}); const src = await Bun.file('scripts/build/deps/zlib.ts').text(); t.transformSync(src); console.log('zlib.ts parses OK')"
           sed -i 's/"_avx2.c", "-mavx2"/"_avx2.c", "-msse4.1"/' scripts/build/deps/libwebp.ts
           grep -rl --include="*.ts" "nehalem" scripts/ test/ | while read f; do
             sed -i 's/\bnehalem\b/penryn/g; s/\bNehalem\b/Penryn/g; s/\bNEHALEM\b/PENRYN/g' "$f"
